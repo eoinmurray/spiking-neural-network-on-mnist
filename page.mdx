@@ -1,0 +1,593 @@
+import rawData from './reports/training_results.json'
+import ImagePlot from './components/image-plot'
+import SpikeTrainPlot from './components/spike-train-plot'
+import MembranePotentialPlot from './components/membrane-potential-plot'
+import StackedLinePlot from './components/stacked-line-plot'
+import LinePlot from './components/line-plot'
+import StackedHistogram from './components/stacked-histogram'
+
+
+<div className="max-w-[800px] mx-auto p-4">
+   <div className="prose dark:prose-invert">
+
+# Spiking Neural Network classifying MNIST data
+
+This notebook describes a spiking neural network (SNN) simulation that performs digit classification on the MNIST dataset. Using only NumPy for implementation, our model achieves over 90% classification accuracy on the MNIST test set. The network uses leaky integrate-and-fire (LIF) neurons and is trained using surrogate gradient descent. The implementation includes time-resolved Poisson encoding of images, a two-layer feedforward architecture, and logging of membrane potentials and spike activity throughout simulation and training.
+
+## Notation
+
+- $x_i(t)$: spike of input neuron $i$ at time $t$.  
+- $h_j(t)$: spike of hidden neuron $j$ at time $t$.  
+- $o_k(t)$: spike of output neuron $k$ at time $t$.  
+- $V_h^j(t)$, $V_o^k(t)$: membrane potentials.  
+- $W_{ih}^{j}$: weight from input $i$ to hidden $j$.  
+- $W_{ho}^{k j}$: weight from hidden $j$ to output $k$.  
+- $\sigma'(V)$: surrogate gradient of the spiking nonlinearity.
+
+## Dataset and encoding
+
+The network operates on the MNIST dataset, consisting of 28×28 grayscale images of handwritten digits. 
+Each image is encoded into a binary spike train using a Poisson encoder. 
+
+```python
+def poisson_encode_speed(images, num_time_steps):
+    images = images.numpy() # Convert to numpy array from pytorch
+    images = images.reshape(images.shape[0], -1) # Flatten the images
+    spike_probabilities = np.repeat(images[:, None, :], num_time_steps, axis=1) # Repeat for time steps
+    return np.random.rand(*spike_probabilities.shape) < spike_probabilities # Generate spikes
+
+```
+
+For a given number of simulation time steps (default: 100), each pixel is treated as an independent Poisson process whose firing probability 
+is proportional to its intensity. This generates a binary tensor of shape [batch_size, num_time_steps, num_pixels]
+representing spike events over time. **Figure 1** below shows an example MNIST image and its corresponding spike train encoding, demonstrating how the static image is transformed into a temporal pattern of spikes.
+   </div>
+</div>
+
+
+
+<div className="w-full mx-auto p-4 border">
+   <div className="max-w-[800px] mx-auto p-4">
+   <div className="grid grid-cols-2">
+      <div className="flex flex-col items-center justify-center">
+         <ImagePlot
+            rawData={rawData.last_test_image_record.image_data}
+            width={300}
+            height={300}
+         />
+      </div>
+      <div className="flex flex-col items-center justify-center">
+         <SpikeTrainPlot 
+            rawData={rawData.last_test_image_record.input_spike_trains}
+            width={400}
+            height={400}
+         />
+      </div>
+   </div>
+   <div 
+      className="text-sm italic text-center mt-2"
+   ><strong>Figure 1:</strong> An MNIST image (left) and its corresponding spike train (right). The spike train shows neural activity across 100 time steps (horizontal axis) for each of the 784 input neurons (vertical axis), with brighter points indicating spike events.</div>
+   </div>
+</div>
+
+
+
+<div className="max-w-[800px] mx-auto p-4">
+   <div className="prose dark:prose-invert">
+## Network architecture
+
+The SNN is structured as a fully connected feedforward network with the following layers:
+
+- Input layer: One neuron per image pixel (784 for MNIST).
+- Hidden layer: 100 LIF neurons.
+- Output layer: 10 LIF neurons corresponding to the 10 digit classes.
+
+Despite this simple architecture and using pure NumPy (without deep learning frameworks), our model achieves >90% classification accuracy on MNIST. This demonstrates the computational power of spiking neural networks even with minimal layer complexity.
+
+Connections between layers are initialized with uniform random weights drawn from a variance-scaled distribution to promote stable forward propagation:
+
+```python
+weights_input_to_hidden = np.random.uniform(
+    -np.sqrt(1 / num_input_neurons), np.sqrt(1 / num_input_neurons), 
+    size=(num_input_neurons, num_hidden_neurons)
+)
+weights_hidden_to_output = np.random.uniform(
+    -np.sqrt(1 / num_hidden_neurons), np.sqrt(1 / num_hidden_neurons), 
+    size=(num_hidden_neurons, num_output_neurons)
+)
+```
+
+The weight distributions before and after training are shown in **Figure 5** (at the end of this document), illustrating how learning reshapes the weight distributions during training.
+
+## LIF dynamics
+
+Each image is presented for $T = 100$ time steps with $\Delta t = 1$ ms per step. This time window is critical as it:
+- Allows sufficient time for information to propagate through the network
+- Enables temporal integration of spikes to form robust representations
+- Balances computational requirements with classification accuracy
+- Provides enough samples for reliable rate coding
+
+The LIF neurons integrate input spikes over time with a decay constant $\tau$ and reset on spiking:
+$$
+\tau \frac{dV(t)}{dt} = -V(t) + I(t).
+$$
+In discrete time:
+$$
+V(t + 1) = \alpha V(t) + (1 - \alpha) I(t), \quad \text{with } \alpha = e^{-1/\tau}.
+$$
+
+- Membrane potential $V$ increases with input (see `membrane_potential = membrane_decay * membrane_potential + input_current` in code below)
+- A spike is emitted when $V > V_{\text{thresh}}$ (see `spikes = membrane_potential > membrane_threshold`)
+- After spiking, $V$ is reset to $V_{\text{reset}}$ (0.0) (see `membrane_potential[spikes] = 0.0`)
+- $V$ decays over time with leak factor $\alpha$ (via the `membrane_decay` term in the update equation)
+
+This behavior is implemented in the `lif_step` function:
+
+```python
+def lif_step(input_current, membrane_potential, membrane_decay, surrogate_grad_steepness, membrane_threshold = 1.0):
+    # Update membrane potential with decay and input current
+    membrane_potential = membrane_decay * membrane_potential + input_current
+    
+    # Determine which neurons spike (V > threshold)
+    spikes = membrane_potential > membrane_threshold
+    
+    # Calculate surrogate gradient for backward pass
+    exp_term = np.exp(-surrogate_grad_steepness * membrane_potential - 1.0)
+    grad_surrogate = surrogate_grad_steepness * exp_term / (1.0 + exp_term) ** 2
+    
+    # Reset membrane potential for neurons that spiked
+    membrane_potential[spikes] = 0.0
+    
+    return spikes.astype(float), membrane_potential, grad_surrogate
+```
+
+This behavior is non-differentiable, so we use the surrogate gradient during training.
+
+## Surrogate gradient
+
+We use a fast sigmoid as the surrogate:
+
+$$
+\sigma (V) = \frac{1}{1+e^{-\beta V - 1}}
+$$
+
+with derivative
+
+$$
+\sigma'(V) = \frac{ \beta e^{-\beta(V-1)} }{ (1 + e^{-\beta(V-1)})^2 }
+$$
+
+where $\beta$ is the steepness parameter (set to 5.0 in our implementation). You can see the implementation of this surrogate gradient in the `lif_step` function in the section that calculates `exp_term` and `grad_surrogate`.
+
+## Loss Function
+
+We use the standard cross‑entropy loss on the time‑integrated output firing rates:
+$$
+\mathcal{L} \;=\; -\sum_{k=1}^{N} y_k \,\log\!\bigl(\hat y_k\bigr),
+$$
+where $N$ is the number of classes, $y_k$ the one‑hot target, and $\hat y_k$ the softmax probability for class $k$.
+
+The implementation computes softmax probabilities from time-integrated spike counts and compares them with one-hot encoded targets:
+
+```python
+# Accumulate spikes over all time steps
+output_spike_accumulator += spikes_output
+
+# After time simulation, compute softmax probabilities
+softmax_numerators = np.exp(output_spike_accumulator - np.max(output_spike_accumulator, axis=1, keepdims=True))
+probabilities = softmax_numerators / softmax_numerators.sum(axis=1, keepdims=True)
+
+# Create one-hot targets
+one_hot_targets = np.zeros_like(probabilities)
+one_hot_targets[np.arange(len(label_batch)), label_batch.numpy()] = 1
+
+# Compute cross-entropy loss
+loss = -np.mean(np.sum(one_hot_targets * np.log(probabilities + 1e-9), axis=1))
+
+# Compute gradient of loss with respect to logits
+grad_logits = (probabilities - one_hot_targets) / batch_size
+```
+
+## Training protocol
+
+Training is carried out over a fixed number of epochs (default: 5) using mini-batches of size 128. As shown in **Figure 2**, the network rapidly improves from random performance (~10% accuracy) to over 90% accuracy within just 5 epochs, highlighting the efficiency of our NumPy-based implementation and the surrogate gradient approach. The loss curve correspondingly shows a steady decrease. For each batch:
+
+   </div>
+</div>
+
+
+
+<div className="w-full mx-auto p-4 border">
+   <div className="max-w-[800px] mx-auto p-4">
+      <div className="grid grid-cols-2">
+         <div className="flex flex-col items-center justify-center">
+            <LinePlot
+               data={rawData.accuracies}
+               xLabel="Epochs"
+               yLabel="Accuracy"
+               width={400}
+               height={200}
+            />
+         </div>
+         <div className="flex flex-col items-center justify-center">
+            <LinePlot
+               data={rawData.losses}
+               xLabel="Epochs"
+               yLabel="Losses"
+               width={400}
+               height={200}
+            />
+         </div>
+      </div>
+      <div 
+         className="text-sm italic text-center mt-2"
+      ><strong>Figure 2:</strong> Accuracy vs epochs (left) and loss vs epochs (right).</div>
+   </div>
+</div>
+
+
+
+<div className="max-w-[800px] mx-auto p-4">
+<div className="prose dark:prose-invert">
+
+- Spike trains are generated from images using the Poisson encoder (as shown in the `poisson_encode_speed` function).
+- Spikes are propagated forward through the network over 100 time steps (in the forward pass loop with `for t in range(num_time_steps)`).
+- Gradients are computed via backpropagation-through-time using surrogate gradients (in the backward pass with `for t in reversed(range(num_time_steps))`).
+- Weight updates are applied at the end of each batch:
+
+**Figure 3** below shows the spiking activity and membrane potentials for a test image after training, visualizing how information flows through the network and how membrane potentials evolve to generate classification outputs.
+```python
+# Apply weight updates
+weights_input_to_hidden -= learning_rate * grad_weights_input
+weights_hidden_to_output -= learning_rate * grad_weights_output
+```
+
+</div>
+</div>
+
+
+
+<div className="w-full mx-auto p-4 border">
+   <div className="max-w-[800px] mx-auto p-4">
+      <div className="flex mx-auto items-center justify-center">
+         <div className="flex flex-col items-center justify-center">
+            <SpikeTrainPlot 
+               rawData={rawData.last_test_image_record.hidden_spike_trains}
+               width={350}
+               height={350}
+            />
+         </div>
+         <div className="flex flex-col items-center justify-center">
+            <SpikeTrainPlot 
+               rawData={rawData.last_test_image_record.output_spike_trains}
+               width={350}
+               height={350}
+            />
+         </div>
+         <div className="flex flex-col items-center justify-center">
+            <MembranePotentialPlot
+               beforeResetData={rawData.last_test_image_record.output_membrane_potentials_before_reset}
+               afterResetData={rawData.last_test_image_record.output_membrane_potentials_after_reset}
+               threshold={rawData.last_test_image_record.membrane_threshold}
+               width={350}
+               height={350}
+            />
+         </div>
+      </div>
+      <div 
+         className="text-sm italic text-center mt-2"
+      ><strong>Figure 3:</strong> Spike trains and membrane potentials for the last image in the evaluation run with the trained model. Left: Spike trains for the hidden layer, Middle: Spike trains for the output layer, Right: Membrane potentials for the output layer.</div>
+   </div>
+</div>
+
+
+
+<div className="max-w-[800px] mx-auto p-4">
+   <div className="prose dark:prose-invert">
+# Backpropagation Through Time (BPTT)
+
+Because the spiking network evolves over time, we use backpropagation through time (BPTT) to train it. Our NumPy implementation of BPTT achieves remarkable efficiency, reaching >90% accuracy on MNIST while remaining computationally tractable on standard hardware. This involves unrolling the network across time steps and computing gradients by summing contributions from each time step. For each weight, we accumulate partial derivatives of the loss with respect to the membrane potential and spike history at each time step:
+
+$$
+\frac{\partial L}{\partial W} = \sum_t \frac{\partial L}{\partial W}(t)
+$$
+
+As shown in the code implementation below, we accumulate gradients by iterating through each time step in reverse order using a backward loop. **Figure 4** illustrates the L2 norms of the gradients for both hidden and output layers throughout training, providing insight into the training dynamics and stability.
+
+## Temporal Dependencies in SNNs
+
+The key challenge in SNNs is that the network state at time $t$ depends on the history of spikes and membrane potentials from previous time steps. Due to the leaky integrate-and-fire dynamics:
+
+$$
+V(t + 1) = \alpha V(t) + (1 - \alpha) I(t)
+$$
+
+the current membrane potential depends on all previous inputs and spikes. This creates a complex temporal dependency chain that must be correctly backpropagated during training.
+
+## Handling Recurrent Dependencies
+
+During BPTT, we treat our SNN as a recurrent neural network unrolled in time, where:
+
+1. Forward pass: Propagate activity sequentially through time steps 1 to T
+2. Backward pass: Propagate gradients backwards from time step T to 1
+
+For each time step $t$, gradients flow through two paths:
+- Direct path: From loss to spike to membrane potential to weights
+- Recurrent path: From current membrane potential back to previous membrane potentials
+
+$$
+\frac{\partial V(t)}{\partial V(t-1)} = \alpha
+$$
+
+This recurrent dependency is captured in our implementation by storing the complete history of spikes and membrane states during the forward pass (using the `spike_history_hidden` and `input_current_history_hidden` arrays) and then processing them in reverse temporal order during backpropagation (using the `for t in reversed(range(num_time_steps))` loop).
+
+The recurrent dependency significantly affects how gradients flow through time during backpropagation. When a neuron spikes at time $t$, it influences:
+
+1. The immediate forward connections to the next layer at time $t$
+2. Its own future membrane potential at time $t+1, t+2, ...$
+
+For each backward step through time, gradients must be propagated through both these paths:
+
+* Direct contribution: From the current time step's loss to weights
+* Temporal contribution: From future time steps' states back to this time step
+
+This creates a multiplicative effect where gradients from later time steps flow through a chain of dependencies. Since $\frac{\partial V(t+1)}{\partial V(t)} = \alpha$ and we apply this recursively, gradients from time step $t+k$ to time step $t$ are scaled by $\alpha^k$. This scaling can cause gradient attenuation over long time horizons for small $\alpha$ (high leakage) or potential instability for values of $\alpha$ close to 1 (low leakage).
+
+## Handling Discontinuities with Surrogate Gradients
+
+The spike function is discontinuous (step function), making the network non-differentiable. The surrogate gradient approach replaces this non-differentiable function with a differentiable approximation (sigmoid) during the backward pass only:
+
+$$
+\frac{\partial \text{Spike}}{\partial V} \approx \sigma'(V)
+$$
+
+This allows gradient flow while preserving the discrete spiking behavior in the forward pass. As shown in the code implementation, we recalculate the surrogate gradients during the backward pass (using the `lif_step` function to get the `grad_output` and `grad_hidden` values).
+
+## Implementation of BPTT
+
+The implementation of BPTT in our code involves significant memory considerations. For a network with $N$ neurons simulated for $T$ time steps, we need to store:
+- Spike history: $O(N \times T)$ memory
+- Membrane potential history: $O(N \times T)$ memory
+- Input current history: $O(N \times T)$ memory
+
+This memory usage is reflected in our gradient computations shown in **Figure 4**, which displays how gradient magnitudes evolve during training. For very long sequences or large networks, this can become prohibitively expensive. Alternative approaches like truncated BPTT (where gradients are backpropagated only through a limited number of time steps) can reduce memory requirements at the cost of approximating the true gradient.
+
+Our implementation handles these requirements by:
+
+1. Storing activity history during the forward pass:
+```python
+# During forward pass - storing spike activity and input currents
+spike_history_hidden = []
+input_current_history_hidden = []
+
+for t in range(num_time_steps):
+    current_input_hidden = encoded_spikes[:, t, :] @ weights_input_to_hidden
+    spikes_hidden, membrane_potential_hidden, grad_hidden = lif_step(current_input_hidden, membrane_potential_hidden, membrane_decay, surrogate_grad_steepness, membrane_threshold)
+    spike_history_hidden.append(spikes_hidden)
+    input_current_history_hidden.append(current_input_hidden)
+    current_input_output = spikes_hidden @ weights_hidden_to_output
+    spikes_output, membrane_potential_output, grad_output = lif_step(current_input_output, membrane_potential_output, membrane_decay, surrogate_grad_steepness, membrane_threshold)
+    output_spike_accumulator += spikes_output
+```
+
+2. Backpropagating gradients through time in reverse order:
+```python
+# During backward pass - iterating backward through time steps
+for t in reversed(range(num_time_steps)):
+    spikes_hidden = spike_history_hidden[t]
+    input_current_hidden = input_current_history_hidden[t]
+    current_input_output = spikes_hidden @ weights_hidden_to_output
+
+    # Calculate output gradients
+    _, _, grad_output = lif_step(current_input_output, np.zeros_like(membrane_potential_output), membrane_decay, surrogate_grad_steepness, membrane_threshold)
+    grad_output_current = grad_logits * grad_output
+    grad_weights_output += spikes_hidden.T @ grad_output_current
+    
+    # Backpropagate to hidden layer
+    grad_spikes_hidden = grad_output_current @ weights_hidden_to_output.T
+    
+    # Calculate hidden gradients
+    _, _, grad_hidden = lif_step(input_current_hidden, np.zeros_like(membrane_potential_hidden), membrane_decay, surrogate_grad_steepness, membrane_threshold)
+    grad_input_hidden = grad_spikes_hidden * grad_hidden
+    grad_weights_input += encoded_spikes[:, t, :].T @ grad_input_hidden
+```
+   </div>
+</div>
+
+
+
+<div className="w-full mx-auto p-4 border">
+   <div className="max-w-[800px] mx-auto p-4">
+      <div className="grid grid-cols-1">
+         <div className="flex flex-col items-center justify-center">
+            <StackedLinePlot
+               data1={rawData.grad_norms.input}
+               data2={rawData.grad_norms.output}
+               width={400}
+               height={200}
+            />
+         </div>
+      </div>
+      <div 
+         className="text-sm italic text-center mt-2"
+      ><strong>Figure 4:</strong> L2 norms for the hidden layer and output gradients recorded every 50 iterations</div>
+   </div>
+</div>
+
+
+
+<div className="max-w-[800px] mx-auto p-4">
+   <div className="prose dark:prose-invert">
+
+## Gradient w.r.t. Hidden→Output Weights $W_{ho}^{kj}$
+
+We want
+$$
+\frac{\partial \mathcal{L}}{\partial W_{ho}^{kj}}
+=\sum_{t}
+\frac{\partial \mathcal{L}}{\partial o_k(t)}
+\;\frac{\partial o_k(t)}{\partial V_o^k(t)}
+\;\frac{\partial V_o^k(t)}{\partial W_{ho}^{kj}}.
+$$
+
+1. **Error at the spike output**  
+   $$
+   \frac{\partial \mathcal{L}}{\partial o_k(t)}
+   = \hat y_k - y_k.
+   $$
+
+2. **Surrogate spike derivative**  
+   $$
+   \frac{\partial o_k(t)}{\partial V_o^k(t)}
+   \approx \sigma'\bigl(V_o^k(t)\bigr).
+   $$
+
+3. **Voltage w.r.t. weight**  
+   $$
+   V_o^k(t) = \sum_{j} W_{ho}^{kj}\,h_j(t)
+   \quad\Longrightarrow\quad
+   \frac{\partial V_o^k(t)}{\partial W_{ho}^{kj}}
+   = h_j(t).
+   $$
+
+Putting it together:
+$$
+\boxed{
+\frac{\partial \mathcal{L}}{\partial W_{ho}^{kj}}
+= \sum_{t}
+\bigl(\hat y_k - y_k\bigr)
+\;\sigma'\bigl(V_o^k(t)\bigr)\;
+h_j(t)
+}.
+$$
+
+## Gradient w.r.t. Input→Hidden Weights $W_{ih}^{j i}$
+
+We want
+$$
+\frac{\partial \mathcal{L}}{\partial W_{ih}^{j i}}
+=\sum_{t}
+\frac{\partial \mathcal{L}}{\partial h_j(t)}
+\;\frac{\partial h_j(t)}{\partial V_h^j(t)}
+\;\frac{\partial V_h^j(t)}{\partial W_{ih}^{j i}}.
+$$
+
+1. **Backpropagated error into hidden spike**  
+   $$
+   \frac{\partial \mathcal{L}}{\partial h_j(t)}
+   = \sum_{k}
+     \frac{\partial \mathcal{L}}{\partial o_k(t)}
+     \;\frac{\partial o_k(t)}{\partial V_o^k(t)}
+     \;\frac{\partial V_o^k(t)}{\partial h_j(t)}
+   = \sum_{k}
+     (\hat y_k - y_k)\,
+     \sigma'\bigl(V_o^k(t)\bigr)\,
+     W_{ho}^{kj}.
+   $$
+
+2. **Surrogate at hidden layer**  
+   $$
+   \frac{\partial h_j(t)}{\partial V_h^j(t)}
+   \approx \sigma'\bigl(V_h^j(t)\bigr).
+   $$
+
+3. **Voltage w.r.t. weight**  
+   $$
+   V_h^j(t) = \sum_{i} W_{ih}^{j i}\,x_i(t)
+   \quad\Longrightarrow\quad
+   \frac{\partial V_h^j(t)}{\partial W_{ih}^{j i}}
+   = x_i(t).
+   $$
+
+Together:
+$$
+\boxed{
+\frac{\partial \mathcal{L}}{\partial W_{ih}^{j i}}
+= \sum_{t}
+\Bigl[\sum_{k}
+(\hat y_k - y_k)\,
+\sigma'\bigl(V_o^k(t)\bigr)\,
+W_{ho}^{kj}
+\Bigr]
+\;\sigma'\bigl(V_h^j(t)\bigr)\;
+x_i(t)
+}.
+$$
+
+These equations are implemented in the backward pass code, where we:
+1. First calculate the output layer gradients (`grad_output_current = grad_logits * grad_output`)
+2. Then backpropagate to the hidden layer (`grad_spikes_hidden = grad_output_current @ weights_hidden_to_output.T`)
+3. Finally accumulate the weight gradients for both layers (`grad_weights_output += ...` and `grad_weights_input += ...`)
+
+The effect of these weight updates is visualized in **Figure 5**, showing how the weight distributions change from their initial random state to more structured patterns after training.
+   </div>
+</div>
+
+
+
+<div className="w-full mx-auto p-4 border">
+   <div className="max-w-[800px] mx-auto p-4">
+      <div className="grid grid-cols-2">
+         <div className="flex flex-col items-center justify-center">
+            <StackedHistogram
+               rawData={rawData.weights_input_to_hidden_start.flat()}
+            />
+         </div>
+         <div className="flex flex-col items-center justify-center">
+            <StackedHistogram
+               rawData={rawData.weights_input_to_hidden_end.flat()}
+            />
+         </div>
+      </div>
+      <div className="grid grid-cols-2">
+         <div className="flex flex-col items-center justify-center">
+            <StackedHistogram
+               rawData={rawData.weights_hidden_to_output_start.flat()}
+            />
+         </div>
+         <div className="flex flex-col items-center justify-center">
+            <StackedHistogram
+               rawData={rawData.weights_hidden_to_output_end.flat()}
+            />
+         </div>
+      </div>
+      <div 
+         className="text-sm italic text-center mt-2"
+      ><strong>Figure 5:</strong> Weight distributions before and after training. Top left: Input layer weights before training. Top right: Input layer weights after training. Bottom left: Hidden layer weights before training. Bottom right: Hidden layer weights after training.</div>
+   </div>
+</div>
+
+
+
+<div className="max-w-[800px] mx-auto p-4">
+   <div className="prose dark:prose-invert">
+## Hyperparameter Considerations
+
+Several hyperparameters significantly impact the training stability and performance of the SNN:
+
+- **Membrane decay factor ($\alpha$)**: Controls how quickly neurons "forget" past inputs
+  - Small values (high leakage): Neurons respond primarily to recent inputs, reducing temporal dependencies
+  - Large values (low leakage): Neurons integrate over longer time periods, but may cause vanishing/exploding gradients
+  - Our value (0.9): Balances temporal integration with stable gradient flow
+
+- **Surrogate gradient steepness ($\beta$)**: Controls the sharpness of the surrogate function
+  - Small values: Gradients flow more easily but provide less precise spike timing
+  - Large values: More accurate spike approximation but can lead to vanishing gradients
+  - Our value (5.0): Provides a good balance for MNIST classification
+
+- **Membrane threshold**: Determines spike activation threshold
+  - Lower values: More frequent spiking, higher network activity
+  - Higher values: Sparser activity, potentially more energy-efficient
+  - Our value (1.5): Selected to produce appropriate activity levels for MNIST
+
+- **Learning rate**: Controls weight update magnitude
+  - Must be carefully tuned due to the complex temporal dynamics and potential gradient issues
+
+## Conclusion
+
+This simulation provides a complete pipeline for training a spiking neural network on image classification tasks using biologically inspired encoding, LIF dynamics, and surrogate gradient descent. Using only NumPy, we achieved over 90% classification accuracy on MNIST, demonstrating that SNNs can be effectively trained without specialized deep learning frameworks. The implementation emphasizes transparency and analysis through detailed logging of neuronal activity and performance metrics, making it suitable for both educational and experimental use. The BPTT implementation demonstrates how to handle the unique challenges of training temporal networks with discrete spike events, while maintaining computational efficiency.
+   </div>
+</div>
+
+<div className="mb-64">
+</div>
