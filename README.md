@@ -41,7 +41,7 @@ git clone https://github.com/yourusername/spiking-neural-network-on-mnist.git
 cd spiking-neural-network-on-mnist
 
 # Install dependencies
-pip install -r requirements.txt
+uv sync
 ```
 
 ### Running the Model
